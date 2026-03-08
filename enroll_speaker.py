@@ -3,8 +3,8 @@
 Enroll your voice as the "candidate" for the interview coach.
 
 Records from your microphone, sends the audio to Speechmatics with speaker
-diarization, then saves your speaker identifiers so coach.py can tag only
-your speech and send it to Ollama.
+diarization (operating_point="enhanced" to match coach.py), then saves your
+speaker identifiers so coach.py can tag only your speech and send it to Ollama.
 
 Recommended: 8–12 seconds of clear speech. Shorter = faster upload; too short
 may not give a stable voiceprint. 15s is fine but takes longer to upload.
@@ -118,8 +118,10 @@ async def run_enrollment(
         "max_speakers": 2,
         "get_speakers": True,
     }
+    # Must match coach.py operating_point so saved identifiers work in streaming.
     conf = TranscriptionConfig(
         language=language,
+        operating_point="enhanced",
         diarization="speaker",
         speaker_diarization_config=speaker_diarization_config,
     )
