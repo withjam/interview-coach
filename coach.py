@@ -81,6 +81,8 @@ DEFAULT_FULL_MESSAGE_PAUSE_SECONDS = 1.5
 MIN_FULL_MESSAGE_PAUSE_SECONDS = 1.0
 SENTENCE_END_CHARS = ".?!"
 
+SESSION_STATE_PATH = os.path.join(os.path.dirname(__file__), ".coach_session.json")
+
 DEFAULT_ENROLLMENT_PATH = os.path.join(
     os.path.dirname(__file__), "speaker_enrollment.json"
 )
@@ -100,9 +102,49 @@ def load_speaker_enrollment() -> dict | None:
         return None
 
 
-def load_prompt() -> str | None:
-    """Load optional prompt instructions from prompt.md next to this script."""
-    prompt_path = os.path.join(os.path.dirname(__file__), "prompt.md")
+def load_session_state(chat_model: str, coach_kind: str) -> list[dict]:
+    """Load previous conversation messages from disk, if compatible; otherwise empty list."""
+    try:
+        with open(SESSION_STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    if data.get("model") != chat_model or data.get("coach_kind") != coach_kind:
+        return []
+    msgs = data.get("messages")
+    return msgs if isinstance(msgs, list) else []
+
+
+def save_session_state(messages: list[dict], chat_model: str, coach_kind: str) -> None:
+    """Persist minimal session state so we can restore context after restart."""
+    payload = {
+        "model": chat_model,
+        "coach_kind": coach_kind,
+        "messages": messages,
+    }
+    try:
+        with open(SESSION_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+    except OSError:
+        # Best-effort only; ignore persistence errors.
+        pass
+
+
+def load_prompt(kind: str = "algo") -> str | None:
+    """Load optional prompt instructions for the selected coach kind.
+
+    kind:
+      - "algo"  : algorithm / coding interview coach (default, uses prompt.md)
+      - "system": system design coach (uses prompt_system.md)
+    """
+    base_dir = os.path.dirname(__file__)
+    if kind == "system":
+        filename = "prompt_system.md"
+    else:
+        filename = "prompt.md"
+    prompt_path = os.path.join(base_dir, filename)
     try:
         with open(prompt_path, "r", encoding="utf-8") as f:
             content = f.read().strip()
@@ -110,7 +152,7 @@ def load_prompt() -> str | None:
     except FileNotFoundError:
         return None
     except OSError as e:
-        print(f"Warning: could not read prompt.md: {e}", file=sys.stderr)
+        print(f"Warning: could not read {filename}: {e}", file=sys.stderr)
         return None
 
 
@@ -157,6 +199,31 @@ def prompt_model() -> str:
             if 0 <= choice_int < len(MODEL_OPTIONS):
                 return MODEL_OPTIONS[choice_int]
             print(f"Please enter a number between 0 and {len(MODEL_OPTIONS) - 1}.")
+        except ValueError:
+            print("Invalid input. Enter a number.")
+        except (EOFError, KeyboardInterrupt):
+            sys.exit(0)
+
+
+def prompt_coach_kind() -> str:
+    """Prompt user to select which coach prompt/template to use."""
+    options = [
+        ("algo", "Algorithms / coding interview coach"),
+        ("system", "System design coach"),
+    ]
+    print("\nAvailable coach types:\n")
+    for idx, (_, label) in enumerate(options):
+        print(f"  [{idx}] {label}")
+    print()
+    while True:
+        try:
+            choice = input("Select a coach type by number (default: 0): ").strip()
+            if choice == "":
+                return options[0][0]
+            choice_int = int(choice)
+            if 0 <= choice_int < len(options):
+                return options[choice_int][0]
+            print(f"Please enter a number between 0 and {len(options) - 1}.")
         except ValueError:
             print("Invalid input. Enter a number.")
         except (EOFError, KeyboardInterrupt):
@@ -313,33 +380,91 @@ def stream_chat(
 ) -> str:
     """Send messages to Ollama Cloud and stream the reply; return full content.
     If stream_output=False, collect full reply without printing (caller will format/print).
+
+    This call is protected by a soft timeout:
+      - If no tokens are received for a period, or
+      - If the total call exceeds a cap,
+    we raise TimeoutError so the caller can log and continue instead of hanging forever.
+
+    NOTE: Debug traces are printed when COACH_DEBUG is enabled so we can
+    understand where hangs occur in practice.
     """
     global _wrap_line_buffer
-    last_error = None
+    # Total timeout in seconds; can be overridden via env if needed.
+    try:
+        total_timeout = float(os.environ.get("COACH_OLLAMA_TOTAL_TIMEOUT", "180"))
+    except ValueError:
+        total_timeout = 180.0
+
+    debug_env = os.environ.get("COACH_DEBUG", "").strip().lower() in ("1", "true", "yes")
+
     for attempt in range(1, OLLAMA_MAX_RETRIES + 1):
-        try:
-            _wrap_line_buffer = ""
-            full = []
-            for part in ollama_client.chat(model=model, messages=messages, stream=True):
-                content = (part.get("message") or {}).get("content") or ""
-                if content:
-                    full.append(content)
-                    if stream_output:
-                        if wrap_width > 0:
-                            _wrap_stream_print(content, wrap_width, continuation_prefix)
-                        else:
-                            print(content, end="", flush=True)
-            if stream_output:
-                if _wrap_line_buffer:
-                    print(_wrap_line_buffer, end="", flush=True)
-                print()
-            return "".join(full)
-        except Exception as e:
-            last_error = e
+        start = time.monotonic()
+        result: dict[str, object | None] = {"reply": None, "error": None}
+
+        def _run_chat():
+            nonlocal result
+            try:
+                if debug_env:
+                    print(
+                        f"  [Debug] Ollama stream_chat attempt {attempt} "
+                        f"(total_timeout={total_timeout}s)",
+                        file=sys.stderr,
+                    )
+                full: list[str] = []
+                global _wrap_line_buffer
+                _wrap_line_buffer = ""
+                stream = ollama_client.chat(model=model, messages=messages, stream=True)
+                for part in stream:
+                    content = (part.get("message") or {}).get("content") or ""
+                    if content:
+                        full.append(content)
+                        if stream_output:
+                            if wrap_width > 0:
+                                _wrap_stream_print(content, wrap_width, continuation_prefix)
+                            else:
+                                print(content, end="", flush=True)
+                if stream_output:
+                    if _wrap_line_buffer:
+                        print(_wrap_line_buffer, end="", flush=True)
+                    print()
+                result["reply"] = "".join(full)
+            except Exception as e:  # noqa: BLE001
+                result["error"] = e
+
+        t = threading.Thread(target=_run_chat, daemon=True)
+        t.start()
+        t.join(total_timeout)
+
+        if t.is_alive():
+            if debug_env:
+                print(
+                    f"  [Debug] Ollama stream_chat total timeout exceeded after "
+                    f"{time.monotonic() - start:.1f}s on attempt {attempt}",
+                    file=sys.stderr,
+                )
             if attempt < OLLAMA_MAX_RETRIES:
                 time.sleep(OLLAMA_RETRY_DELAY_SECONDS)
                 continue
-            raise last_error
+            raise TimeoutError("Ollama chat total timeout exceeded")
+
+        if result["error"] is not None:
+            err = result["error"]  # type: ignore[assignment]
+            if attempt < OLLAMA_MAX_RETRIES:
+                if debug_env:
+                    print(f"  [Debug] Ollama error on attempt {attempt}: {err}", file=sys.stderr)
+                time.sleep(OLLAMA_RETRY_DELAY_SECONDS)
+                continue
+            raise err  # type: ignore[misc]
+
+        reply_text = str(result["reply"] or "")
+        if debug_env:
+            print(
+                f"  [Debug] Ollama stream_chat completed in "
+                f"{time.monotonic() - start:.1f}s, tokens={len(reply_text)}",
+                file=sys.stderr,
+            )
+        return reply_text
 
 
 class SpeechmaticsAudioAdapter:
@@ -381,6 +506,15 @@ class SpeechmaticsAudioAdapter:
 
 def main():
     load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+    # Start with a clean session file so we don't inherit stale context between runs.
+    try:
+        os.remove(SESSION_STATE_PATH)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        # Non-fatal; we can continue without deleting.
+        pass
+
     ollama_key = os.environ.get("OLLAMA_API_KEY")
     speechmatics_key = os.environ.get("SPEECHMATICS_API_KEY")
     if not ollama_key:
@@ -397,6 +531,7 @@ def main():
 
     device_id, dev = prompt_device(inputs)
     chat_model = prompt_model()
+    coach_kind = prompt_coach_kind()
     samplerate = int(dev["default_samplerate"])
     channels = dev["max_input_channels"]
     language = os.environ.get("SPEECHMATICS_LANGUAGE", "en")
@@ -425,6 +560,13 @@ def main():
     else:
         print("  Candidate   : all speech")
     print(f"  Chat model  : {chat_model}")
+    print(f"  Coach type  : {coach_kind}")
+
+    # Optionally restore previous conversation context for this model/coach combination.
+    messages: list[dict] = load_session_state(chat_model, coach_kind)
+    if messages:
+        print("  Session     : restored previous context", file=sys.stderr)
+
     print("\nPress Ctrl+C to stop.\n")
 
     ollama_client = OllamaClient(
@@ -432,9 +574,8 @@ def main():
         headers={"Authorization": f"Bearer {ollama_key}"},
     )
 
-    messages: list[dict] = []
     # Load but do not send the initial prompt until there is actual conversation.
-    prompt_text = load_prompt()
+    prompt_text = load_prompt(coach_kind)
     prompt_applied = False
     has_responded = False
     # Queue of (speaker_label, text) from Speechmatics, before grouping into full messages.
@@ -660,6 +801,12 @@ def main():
                 try:
                     print("\n  —— Coach ——", flush=True)
                     print(f"  {_dim}Thinking...{_reset}", flush=True)
+                    if debug:
+                        print(
+                            f"  [Debug] Calling stream_chat with {len(messages)} messages "
+                            f"(model={chat_model})",
+                            file=sys.stderr,
+                        )
                     if format_output:
                         reply = stream_chat(
                             ollama_client, messages, chat_model, stream_output=False
@@ -680,6 +827,7 @@ def main():
                     if reply:
                         messages.append({"role": "assistant", "content": reply})
                         has_responded = True
+                        save_session_state(messages, chat_model, coach_kind)
                         if tts:
                             try:
                                 subprocess.run(
