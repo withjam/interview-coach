@@ -66,12 +66,12 @@ SPEECHMATICS_RETRY_DELAY_SECONDS = 2
 
 # Ollama
 OLLAMA_CLOUD_HOST = "https://ollama.com"
-DEFAULT_CHAT_MODEL = "minimax-m2:cloud"
+DEFAULT_CHAT_MODEL = "deepseek-v4-pro:cloud"
 MODEL_OPTIONS = [
-    "minimax-m2:cloud",
-    "gemini-3-flash-preview:cloud",
-    "qwen3-coder-next:cloud",
-    "glm-5:cloud",
+    "minimax-m2.7:cloud",
+    "gemma4:31b-cloud",
+    "deepseek-v4-pro:cloud",
+    "kimi-k2.6:cloud",
 ]
 OLLAMA_MAX_RETRIES = 3
 OLLAMA_RETRY_DELAY_SECONDS = 1.5
@@ -137,11 +137,14 @@ def load_prompt(kind: str = "algo") -> str | None:
 
     kind:
       - "algo"  : algorithm / coding interview coach (default, uses prompt.md)
+      - "dsa"   : 5-step DSA interview coach (uses prompt_dsa.md)
       - "system": system design coach (uses prompt_system.md)
     """
     base_dir = os.path.dirname(__file__)
     if kind == "system":
         filename = "prompt_system.md"
+    elif kind == "dsa":
+        filename = "prompt_dsa.md"
     else:
         filename = "prompt.md"
     prompt_path = os.path.join(base_dir, filename)
@@ -209,6 +212,7 @@ def prompt_coach_kind() -> str:
     """Prompt user to select which coach prompt/template to use."""
     options = [
         ("algo", "Algorithms / coding interview coach"),
+        ("dsa", "DSA 5-step interview coach (Senior Staff)"),
         ("system", "System design coach"),
     ]
     print("\nAvailable coach types:\n")
