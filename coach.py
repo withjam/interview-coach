@@ -66,10 +66,10 @@ SPEECHMATICS_RETRY_DELAY_SECONDS = 2
 
 # Ollama
 OLLAMA_CLOUD_HOST = "https://ollama.com"
-DEFAULT_CHAT_MODEL = "deepseek-v4-pro:cloud"
+DEFAULT_CHAT_MODEL = "gemma4:31b-cloud"
 MODEL_OPTIONS = [
-    "minimax-m2.7:cloud",
     "gemma4:31b-cloud",
+    "minimax-m2.7:cloud",
     "deepseek-v4-pro:cloud",
     "kimi-k2.6:cloud",
 ]
